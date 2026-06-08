@@ -11,6 +11,7 @@ type Session struct {
 	ID              uint32
 	SharedSecret    []byte
 	RemotePublicKey *ecdh.PublicKey
+	RemoteUsername  string
 	Conn            net.Conn
 }
 

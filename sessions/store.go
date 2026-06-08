@@ -4,12 +4,14 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"golang.org/x/crypto/argon2"
 	_ "modernc.org/sqlite"
@@ -45,18 +47,55 @@ func OpenMessageStore(passphrase string) (*MessageStore, error) {
 		return nil, err
 	}
 
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS messages (
-		id        INTEGER PRIMARY KEY AUTOINCREMENT,
-		peer      TEXT    NOT NULL,
-		content   BLOB    NOT NULL,
-		timestamp INTEGER NOT NULL,
-		outgoing  INTEGER NOT NULL
-	)`)
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS messages (
+			id        INTEGER PRIMARY KEY AUTOINCREMENT,
+			peer      TEXT    NOT NULL,
+			content   BLOB    NOT NULL,
+			timestamp INTEGER NOT NULL,
+			outgoing  INTEGER NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS contacts (
+			username   TEXT PRIMARY KEY,
+			pubkey_hex TEXT NOT NULL,
+			added_at   INTEGER NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS meta (
+			key   TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
+	`)
 	if err != nil {
 		return nil, err
 	}
 
 	key := argon2.IDKey([]byte(passphrase), dbSalt, 1, 64*1024, 4, 32)
+
+	// Fingerprint = SHA-256 of the encryption key. Stored in plaintext so we
+	// can detect a passphrase change without decrypting any messages.
+	h := sha256.Sum256(key)
+	fingerprint := hex.EncodeToString(h[:])
+
+	var stored string
+	err = db.QueryRow(`SELECT value FROM meta WHERE key = 'fingerprint'`).Scan(&stored)
+	switch {
+	case err == sql.ErrNoRows:
+		// First login — record the fingerprint.
+		_, err = db.Exec(`INSERT INTO meta (key, value) VALUES ('fingerprint', ?)`, fingerprint)
+		if err != nil {
+			return nil, err
+		}
+	case err != nil:
+		return nil, err
+	case stored != fingerprint:
+		// Different passphrase — wipe all user data so stale contacts and
+		// undecryptable messages don't bleed through.
+		_, err = db.Exec(`DELETE FROM messages; DELETE FROM contacts; UPDATE meta SET value = ? WHERE key = 'fingerprint'`, fingerprint)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &MessageStore{db: db, key: key}, nil
 }
 
@@ -124,6 +163,55 @@ func (store *MessageStore) Close() error {
 // PeerKey converts a raw public key to a hex string for use as a peer identifier.
 func PeerKey(pubKeyBytes []byte) string {
 	return hex.EncodeToString(pubKeyBytes)
+}
+
+// Contact is a known peer stored in the local contacts table.
+type Contact struct {
+	Username  string
+	PubKeyHex string
+	AddedAt   int64
+}
+
+// AddContact upserts a contact. If the username already exists it updates the pubkey.
+func (store *MessageStore) AddContact(username, pubKeyHex string) error {
+	_, err := store.db.Exec(
+		`INSERT INTO contacts (username, pubkey_hex, added_at) VALUES (?, ?, ?)
+		 ON CONFLICT(username) DO UPDATE SET pubkey_hex = excluded.pubkey_hex`,
+		username, pubKeyHex, time.Now().Unix(),
+	)
+	return err
+}
+
+// GetContacts returns all stored contacts ordered by username.
+func (store *MessageStore) GetContacts() ([]Contact, error) {
+	rows, err := store.db.Query(
+		`SELECT username, pubkey_hex, added_at FROM contacts ORDER BY username ASC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var contacts []Contact
+	for rows.Next() {
+		var c Contact
+		if err := rows.Scan(&c.Username, &c.PubKeyHex, &c.AddedAt); err != nil {
+			return nil, err
+		}
+		contacts = append(contacts, c)
+	}
+	return contacts, rows.Err()
+}
+
+// GetContact returns a single contact by username.
+func (store *MessageStore) GetContact(username string) (*Contact, error) {
+	var c Contact
+	err := store.db.QueryRow(
+		`SELECT username, pubkey_hex, added_at FROM contacts WHERE username = ?`, username,
+	).Scan(&c.Username, &c.PubKeyHex, &c.AddedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
 }
 
 // Encrypts the plaintext for adding into the db

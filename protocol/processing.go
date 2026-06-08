@@ -6,16 +6,14 @@ import (
 	"net"
 )
 
-// RetrievePacket decyphers and routes an incoming packet.
-// onText is called with the decrypted content when a text packet arrives.
-// onConnect is called when a handshake completes and a session is established.
-func RetrievePacket(sentBytes []byte, private *ecdh.PrivateKey, sm *SessionManager, conn net.Conn, onText func(*Session, string), onConnect func(*Session)) error {
+// RetrievePacket decyphers and routes an incoming packet to the appropriate
+// handler. Nil handlers are silently ignored.
+func RetrievePacket(sentBytes []byte, private *ecdh.PrivateKey, sm *SessionManager, conn net.Conn, handler PacketHandler) error {
 	packet, err := decypherPacket(sentBytes)
 	if err != nil {
 		return err
 	}
 
-	// Handshake and ack arrive before a session exists — everything else must match a known session.
 	var session *Session
 	if packet.Header.PacketType != TypeHandshake && packet.Header.PacketType != TypeHandshakeAck {
 		var ok bool
@@ -26,17 +24,75 @@ func RetrievePacket(sentBytes []byte, private *ecdh.PrivateKey, sm *SessionManag
 	}
 
 	switch packet.Header.PacketType {
+
 	case TypeHandshake:
-		return processRetrievedHandshake(packet, private, sm, conn)
+		return processRetrievedHandshake(packet, private, sm, conn, handler.LocalUsername, handler.OnConnect)
+
 	case TypeHandshakeAck:
-		return processRetrievedHandshakeAck(packet, private, sm, conn, onConnect)
+		return processRetrievedHandshakeAck(packet, private, sm, conn, handler.OnConnect)
+
 	case TypeText:
 		content, err := processRetrievedText(packet, session)
 		if err != nil {
 			return err
 		}
-		onText(session, content)
-		return nil
+		if handler.OnText != nil {
+			handler.OnText(session, content)
+		}
+
+	case TypePing:
+		if err := processRetrievedPing(session, conn); err != nil {
+			return err
+		}
+		if handler.OnPing != nil {
+			handler.OnPing(session)
+		}
+
+	case TypePong:
+		// Nothing to do — pong just confirms the peer is alive.
+
+	case TypeCallStart:
+		if handler.OnCallStart != nil {
+			handler.OnCallStart(session)
+		}
+
+	case TypeCallAudio:
+		if handler.OnCallAudio != nil {
+			handler.OnCallAudio(session, packet.Payload)
+		}
+
+	case TypeCallEnd:
+		if handler.OnCallEnd != nil {
+			handler.OnCallEnd(session)
+		}
+
+	case TypeFileStart:
+		info, err := parseFileStart(packet)
+		if err != nil {
+			return err
+		}
+		if handler.OnFileStart != nil {
+			handler.OnFileStart(session, info)
+		}
+
+	case TypeFileChunk:
+		index, data, err := parseFileChunk(packet)
+		if err != nil {
+			return err
+		}
+		if handler.OnFileChunk != nil {
+			handler.OnFileChunk(session, index, data)
+		}
+
+	case TypeFileEnd:
+		if handler.OnFileEnd != nil {
+			handler.OnFileEnd(session)
+		}
+
+	case TypeDisconnect:
+		if handler.OnDisconnect != nil {
+			handler.OnDisconnect(session)
+		}
 	}
 
 	return nil

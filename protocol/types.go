@@ -20,6 +20,7 @@ const (
 	TypeFileAck      byte = 0x0B
 	TypePing         byte = 0x0C
 	TypePong         byte = 0x0D
+	TypeDisconnect   byte = 0xFE
 	TypeError        byte = 0xFF
 )
 
